@@ -3,6 +3,7 @@ name: Repository Management
 # This workflow triggers on two main events:
 # 1. 'pull_request': To handle automatic merging of PRs.
 # 2. 'schedule': To periodically check for inactivity and manage repository visibility.
+# 3. 'workflow_dispatch': To allow manual triggering of the workflow.
 on:
   pull_request:
     # Trigger this workflow when a pull request is opened, has labels added/removed,
@@ -12,6 +13,7 @@ on:
     # Run this job once a day at 00:00 UTC.
     # You can adjust the cron schedule as needed (e.g., '0 0 * * MON' for weekly on Monday).
     - cron: '0 0 * * *'
+  workflow_dispatch: # This enables manual triggering from the GitHub Actions UI
 
 jobs:
   auto-merge-prs:
@@ -59,7 +61,8 @@ jobs:
   manage-repository-visibility:
     # This job is responsible for managing the repository's visibility.
     # It runs daily according to the schedule configured in the 'on:' section.
-    if: github.event_name == 'schedule'
+    # It also runs when triggered manually via workflow_dispatch.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest # Specifies the runner environment.
     # It's good practice to associate jobs that handle sensitive operations with a GitHub Environment.
     # Ensure you have a 'production' environment configured in your repository settings (Settings > Environments).
