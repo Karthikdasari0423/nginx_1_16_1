@@ -157,23 +157,19 @@ jobs:
           echo "Six months ago timestamp: $(date -d @$SIX_MONTHS_AGO_SECONDS -u +%Y-%m-%dT%H:%M:%SZ) (Epoch: $SIX_MONTHS_AGO_SECONDS)"
           
           CHANGE_VISIBILITY="false"
-          if [ "$LAST_MERGE_SECONDS" -lt "$SIX_MONTHS_AGO_SECONDS" ] && [ "${{ steps.open_prs.outputs.count }}" -eq 0 ]; then
-            if [ "$LAST_MERGE_TIMESTAMP" != "1970-01-01T00:00:00Z" ]; then
+          # NEW LOGIC: Only check timestamp, ignore open PR count for decision to change
+          if [ "$LAST_MERGE_SECONDS" -lt "$SIX_MONTHS_AGO_SECONDS" ]; then
+            if [ "$LAST_MERGE_TIMESTAMP" != "1970-01-01T00:00:00Z" ]; then # Ensure a merge has actually been recorded by the workflow
               CHANGE_VISIBILITY="true"
-              echo "Decision: Conditions met to change visibility to private."
+              echo "Decision: Last merge was over 6 months ago. Conditions met to change visibility to private (open PRs: ${{ steps.open_prs.outputs.count }} - will be ignored for decision)."
             else
               echo "Decision: Do not change visibility. No PRs have been recorded as merged by this workflow yet (timestamp is default)."
             fi
           else
-            if [ "$LAST_MERGE_SECONDS" -ge "$SIX_MONTHS_AGO_SECONDS" ]; then
-              echo "Decision: Do not change visibility. Last merge ($LAST_MERGE_TIMESTAMP) was less than 6 months ago."
-            fi
-            if [ "${{ steps.open_prs.outputs.count }}" -ne 0 ]; then
-              echo "Decision: Do not change visibility. There are ${{ steps.open_prs.outputs.count }} open PRs."
-            fi
+            echo "Decision: Do not change visibility. Last merge ($LAST_MERGE_TIMESTAMP) was less than 6 months ago."
           fi
           echo "change_visibility=$CHANGE_VISIBILITY" >> $GITHUB_OUTPUT
-
+          
       - name: Change repository visibility to private
         if: steps.decision.outputs.change_visibility == 'true'
         env:
