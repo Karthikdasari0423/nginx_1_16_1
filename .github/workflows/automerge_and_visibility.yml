@@ -68,10 +68,9 @@ jobs:
     # Ensure you have a 'production' environment configured in your repository settings (Settings > Environments).
     environment:
       name: production
-    permissions:
-      # The GITHUB_TOKEN permissions for this job are implicitly handled,
-      # as the 'gh api' call relies on the REPO_VISIBILITY_PAT.
-      # No specific GITHUB_TOKEN permissions are explicitly required here for the visibility change.
+    # The GITHUB_TOKEN permissions for this job are implicitly handled,
+    # as the 'gh api' call relies on the REPO_VISIBILITY_PAT.
+    # No specific GITHUB_TOKEN permissions are explicitly required here for the visibility change.
     steps:
       - name: Setup GitHub CLI
         # This action installs and configures the GitHub CLI on the runner.
