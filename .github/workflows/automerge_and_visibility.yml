@@ -1,0 +1,179 @@
+name: Automerge PRs and Manage Repository Visibility
+
+on:
+  pull_request_target:
+    types: [labeled, opened, synchronize, reopened]
+  schedule:
+    # Runs daily at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allows manual triggering
+
+permissions:
+  contents: write # Needed for checking out code and for the merge commit by automerge job
+  pull-requests: write # Needed to merge PRs by automerge job
+  administration: write # Needed to change repository visibility by change_visibility job
+  actions: read # Default, but good to be explicit if other action-related operations were needed
+  checks: read # Needed by automerge to read status checks
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'automerge') || github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'automerge'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          # We need to check out the actual PR branch for merge, not the merge commit
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          # Fetch depth 0 to get all history, needed for merge
+          fetch-depth: 0
+
+      - name: Merge Pull Request
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = github.event.pull_request ? github.event.pull_request.number : (github.event.inputs && github.event.inputs.pr_number ? parseInt(github.event.inputs.pr_number) : null);
+            if (!prNumber) {
+              core.setFailed('Pull request number is not available.');
+              return;
+            }
+
+            try {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+
+              if (pr.merged) {
+                console.log(`PR #${prNumber} is already merged.`);
+                return;
+              }
+
+              if (!pr.mergeable) {
+                core.setFailed(`PR #${prNumber} is not mergeable. Check status checks and conflicts.`);
+                return;
+              }
+              
+              // Additional check for required status checks (customize as needed)
+              const { data: { check_runs } } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: pr.head.sha,
+              });
+
+              const requiredChecks = ['build', 'test']; // Add your required check names here
+              let allChecksPassed = true;
+
+              for (const checkName of requiredChecks) {
+                const check = check_runs.find(run => run.name === checkName);
+                if (!check || check.conclusion !== 'success') {
+                  allChecksPassed = false;
+                  core.warning(`Required check "${checkName}" has not passed or is missing for PR #${prNumber}.`);
+                  // Do not fail immediately, let user decide if they want to merge without all checks if workflow_dispatch
+                  if (github.event_name !== 'workflow_dispatch') {
+                     core.setFailed(`Required check "${checkName}" has not passed or is missing for PR #${prNumber}. Cannot automerge.`);
+                     return;
+                  }
+                }
+              }
+              
+              if (!allChecksPassed && github.event_name !== 'workflow_dispatch') {
+                 core.setFailed(`Not all required checks have passed for PR #${prNumber}. Cannot automerge.`);
+                 return;
+              }
+
+
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                merge_method: 'squash', // Or 'merge' or 'rebase'
+              });
+              console.log(`Successfully merged PR #${prNumber}`);
+
+            } catch (error) {
+              core.setFailed(`Failed to merge PR #${prNumber}: ${error.message}`);
+            }
+
+  change_visibility:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'change_visibility')
+    steps:
+      - name: Change Repository Visibility
+        uses: actions/github-script@v6
+        with:
+          # For changing repository visibility, GITHUB_TOKEN might not have enough permissions
+          # if the repository is owned by a user (not an organization).
+          # For organization repos, GITHUB_TOKEN with `administration: write` should be enough.
+          # If issues arise, a PAT with `repo` and `admin:repo_hook` scopes stored as a secret (e.g., ADMIN_PAT) is recommended.
+          github-token: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }}
+          script: |
+            const sixMonthsAgo = new Date();
+            sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+            const owner = context.repo.owner; // Assuming the workflow runs in the target repo itself.
+                                             // To manage other repos, you'd list them explicitly or fetch them.
+
+            let repos_to_check = [];
+
+            if (github.event.inputs && github.event.inputs.repo_name) {
+              // If a specific repo is provided via workflow_dispatch
+              repos_to_check.push({ name: github.event.inputs.repo_name, owner: owner });
+            } else if (github.event_name == 'schedule') {
+              // For scheduled events, we operate on the current repository.
+              // To make this work for *all* repositories of a user/org, this script would need to be
+              // significantly more complex, listing all repos and then checking each one.
+              // This current script is scoped to the repository it runs in.
+              repos_to_check.push({ name: context.repo.repo, owner: owner });
+            } else {
+              console.log("Skipping visibility change as it's not a scheduled event or a manual dispatch for this job with a specified repo.");
+              return;
+            }
+
+            for (const repo_info of repos_to_check) {
+              try {
+                console.log(`Checking repository: ${repo_info.owner}/${repo_info.name}`);
+                const { data: repo } = await github.rest.repos.get({
+                  owner: repo_info.owner,
+                  repo: repo_info.name,
+                });
+
+                if (repo.private) {
+                  console.log(`Repository ${repo_info.owner}/${repo_info.name} is already private.`);
+                  continue;
+                }
+
+                const updatedAt = new Date(repo.updated_at); // Or repo.created_at, depending on the desired logic
+
+                if (updatedAt < sixMonthsAgo) {
+                  console.log(`Repository ${repo_info.owner}/${repo_info.name} was last updated on ${repo.updated_at} and is older than 6 months. Changing to private.`);
+                  await github.rest.repos.update({
+                    owner: repo_info.owner,
+                    repo: repo_info.name,
+                    private: true,
+                  });
+                  console.log(`Successfully changed visibility of ${repo_info.owner}/${repo_info.name} to private.`);
+                } else {
+                  console.log(`Repository ${repo_info.owner}/${repo_info.name} was last updated on ${repo.updated_at} and is not yet 6 months old.`);
+                }
+              } catch (error) {
+                core.error(`Failed to process repository ${repo_info.owner}/${repo_info.name}: ${error.message}`);
+                if (error.status === 403 || error.status === 401) {
+                  core.warning(`Permission denied for ${repo_info.owner}/${repo_info.name}. Make sure the token (ADMIN_PAT if used) has 'repo' and 'admin:repo_hook' scopes for user-owned repos, or 'administration:write' for organization repos.`);
+                }
+              }
+            }
+# Manual trigger inputs (optional, for easier testing)
+# inputs:
+#   job:
+#     description: 'Job to run (automerge or change_visibility)'
+#     required: false
+#     default: ''
+#   pr_number:
+#     description: 'PR number to automerge (if job is automerge)'
+#     required: false
+#   repo_name:
+#     description: 'Repository name to check for visibility change (if job is change_visibility)'
+#     required: false
