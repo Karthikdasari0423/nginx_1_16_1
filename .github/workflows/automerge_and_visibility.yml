@@ -69,9 +69,9 @@ jobs:
     environment:
       name: production
     permissions:
-      # Grant 'write' permission to the repository scope.
-      # While we use a PAT for explicit authorization, this ensures the GITHUB_TOKEN also has broader context.
-      repository: write
+      # The GITHUB_TOKEN permissions for this job are implicitly handled,
+      # as the 'gh api' call relies on the REPO_VISIBILITY_PAT.
+      # No specific GITHUB_TOKEN permissions are explicitly required here for the visibility change.
     steps:
       - name: Setup GitHub CLI
         # This action installs and configures the GitHub CLI on the runner.
