@@ -1,0 +1,221 @@
+name: Auto Merge and Change Visibility
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    # Runs daily at midnight UTC to check for visibility change
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  auto_merge:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' # Only run this job for pull_request events
+    permissions:
+      contents: write      # Needed to push the timestamp file
+      pull-requests: write # Needed to merge PRs
+      issues: write        # Needed to create issues on failure
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          # Fetch full history to be able to push back to the branch
+          # This is important if the workflow is running on a specific branch for PR checks
+          fetch-depth: 0 
+          # Use a token that can push to the repo, default GITHUB_TOKEN is fine for same-repo PRs
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get PR data
+        id: pr_data
+        run: |
+          echo "PR_NUMBER=$(jq --raw-output .pull_request.number "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "IS_MERGEABLE=$(jq --raw-output .pull_request.mergeable "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "MERGE_STATE=$(jq --raw-output .pull_request.mergeable_state "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "PR_HEAD_SHA=$(jq --raw-output .pull_request.head.sha "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "PR_BASE_REF=$(jq --raw-output .pull_request.base.ref "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+
+      - name: Auto-merge PR
+        if: steps.pr_data.outputs.IS_MERGEABLE == 'true' && steps.pr_data.outputs.MERGE_STATE == 'clean'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_data.outputs.PR_NUMBER }}
+          PR_HEAD_SHA: ${{ steps.pr_data.outputs.PR_HEAD_SHA }}
+        run: |
+          echo "Attempting to auto-merge PR #$PR_NUMBER with HEAD SHA $PR_HEAD_SHA"
+          # Use gh pr merge with --auto and --squash. 
+          # GitHub will only merge if all checks pass and policies are met.
+          gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
+          # The actual merge happens asynchronously if auto-merge is enabled.
+          # This command just enables it for this PR.
+          echo "Auto-merge enabled for PR #$PR_NUMBER"
+
+      - name: Verify merge and update timestamp
+        id: verify_merge
+        if: steps.pr_data.outputs.IS_MERGEABLE == 'true' && steps.pr_data.outputs.MERGE_STATE == 'clean'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_data.outputs.PR_NUMBER }}
+          PR_BASE_REF: ${{ steps.pr_data.outputs.PR_BASE_REF }}
+        run: |
+          echo "::set-output name=merged_successfully::false" # Default to false
+          # Wait a short period to allow GitHub to process the auto-merge instruction
+          echo "Waiting 20 seconds for merge to process..."
+          sleep 20
+          PR_MERGED_STATUS=$(gh pr view "$PR_NUMBER" --json merged --jq .merged)
+
+          if [ "$PR_MERGED_STATUS" = "true" ]; then
+            echo "PR #$PR_NUMBER was merged. Updating timestamp."
+            echo "::set-output name=merged_successfully::true"
+            # Ensure we are on the base branch of the PR to commit the timestamp
+            git fetch origin ${{ env.PR_BASE_REF }}
+            git checkout ${{ env.PR_BASE_REF }}
+            git pull origin ${{ env.PR_BASE_REF }} # Ensure local branch is up-to-date
+
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .last_successful_merge_timestamp
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .last_successful_merge_timestamp
+            if ! git diff --staged --quiet; then
+              git commit -m "CI: Update last successful PR merge timestamp after merging PR #$PR_NUMBER"
+              for i in 1 2 3; do git push origin ${{ env.PR_BASE_REF }} && break || sleep 5; done
+            else
+              echo "No changes to .last_successful_merge_timestamp to commit."
+            fi
+          else
+            echo "PR #$PR_NUMBER not merged yet or auto-merge conditions not met (after 20s wait). Timestamp not updated by this run."
+            # No 'exit 1' here as we want to proceed to the notification step if needed
+          fi
+      
+      - name: Notify on merge failure (if merge was expected)
+        if: steps.pr_data.outputs.IS_MERGEABLE == 'true' && steps.pr_data.outputs.MERGE_STATE == 'clean' && steps.verify_merge.outputs.merged_successfully == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_data.outputs.PR_NUMBER }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          echo "Auto-merge for PR #$PR_NUMBER failed or did not complete in time."
+          gh issue create --title "Auto-merge failed for PR #${PR_NUMBER}" \
+                          --body "Auto-merge was attempted for PR #${PR_NUMBER} in repository ${REPO_SLUG} but it was not confirmed as merged after a short delay. Please investigate. Conditions met: Mergeable, Clean State. PR URL: ${{ github.event.pull_request.html_url }}" \
+                          --label "bug,automation"
+  change_visibility:
+    runs-on: ubuntu-latest
+    # This job should not strictly need auto_merge, as it runs on a schedule independently.
+    # However, if a PR merge just happened, we want that to complete first.
+    # `needs: auto_merge` might cause issues if auto_merge is skipped (e.g. not a PR event).
+    # Let's remove `needs: auto_merge` and ensure checkout fetches the latest state.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read         # To read the .last_successful_merge_timestamp
+      administration: write  # To change repository visibility
+      issues: write          # To create issues on failure
+    steps:
+      - name: Checkout code (default branch)
+        uses: actions/checkout@v3
+        with:
+          # Checkout the repository's default branch to get the latest timestamp file.
+          ref: ${{ github.event.repository.default_branch || 'main' }}
+          token: ${{ secrets.GITHUB_TOKEN }} # For reading the file
+          fetch-depth: 1 # Only need the latest commit to get the file
+
+      - name: Get last successful merge timestamp
+        id: last_merge_date
+        run: |
+          if [ -f .last_successful_merge_timestamp ]; then
+            MERGE_TS=$(cat .last_successful_merge_timestamp)
+            echo "timestamp=$MERGE_TS" >> $GITHUB_OUTPUT
+            echo "Found last merge timestamp: $MERGE_TS"
+          else
+            # If file doesn't exist, it means no PR has been merged by the workflow and committed the timestamp.
+            # Set a very old timestamp to prevent visibility change until a PR is merged.
+            echo "timestamp=1970-01-01T00:00:00Z" >> $GITHUB_OUTPUT
+            echo "No .last_successful_merge_timestamp file found. Assuming no PRs merged by this workflow yet."
+          fi
+
+      - name: Check for open PRs
+        id: open_prs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Needs pull-requests: read permission (default)
+        run: |
+          OPEN_PRS_COUNT=$(gh pr list --state open --limit 100 --json number --jq 'length')
+          echo "count=$OPEN_PRS_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $OPEN_PRS_COUNT open PR(s)."
+
+      - name: Calculate dates and decide on visibility change
+        id: decision
+        run: |
+          LAST_MERGE_TIMESTAMP="${{ steps.last_merge_date.outputs.timestamp }}"
+          # Convert last merge timestamp to seconds since epoch
+          LAST_MERGE_SECONDS=$(date -d "$LAST_MERGE_TIMESTAMP" +%s)
+          # Calculate timestamp 6 months ago in seconds since epoch
+          SIX_MONTHS_AGO_SECONDS=$(date -d "now - 6 months" +%s)
+          
+          echo "Last merge timestamp: $LAST_MERGE_TIMESTAMP (Epoch: $LAST_MERGE_SECONDS)"
+          echo "Six months ago timestamp: $(date -d @$SIX_MONTHS_AGO_SECONDS -u +%Y-%m-%dT%H:%M:%SZ) (Epoch: $SIX_MONTHS_AGO_SECONDS)"
+          
+          CHANGE_VISIBILITY="false"
+          # Check if last merge was more than 6 months ago AND there are no open PRs
+          if [ "$LAST_MERGE_SECONDS" -lt "$SIX_MONTHS_AGO_SECONDS" ] && [ "${{ steps.open_prs.outputs.count }}" -eq 0 ]; then
+            # Additional check: ensure that .last_successful_merge_timestamp is not the default 1970 date
+            if [ "$LAST_MERGE_TIMESTAMP" != "1970-01-01T00:00:00Z" ]; then
+              CHANGE_VISIBILITY="true"
+              echo "Decision: Conditions met to change visibility to private."
+            else
+              echo "Decision: Do not change visibility. No PRs have been recorded as merged by this workflow yet (timestamp is default)."
+            fi
+          else
+            if [ "$LAST_MERGE_SECONDS" -ge "$SIX_MONTHS_AGO_SECONDS" ]; then
+              echo "Decision: Do not change visibility. Last merge ($LAST_MERGE_TIMESTAMP) was less than 6 months ago."
+            fi
+            if [ "${{ steps.open_prs.outputs.count }}" -ne 0 ]; then
+              echo "Decision: Do not change visibility. There are ${{ steps.open_prs.outputs.count }} open PRs."
+            fi
+          fi
+          echo "change_visibility=$CHANGE_VISIBILITY" >> $GITHUB_OUTPUT
+
+      - name: Change repository visibility to private
+        if: steps.decision.outputs.change_visibility == 'true'
+        env:
+          # CRITICAL: This token MUST have admin permissions for the repository.
+          # Using secrets.GITHUB_TOKEN might work if the workflow itself is granted these permissions.
+          # Otherwise, a PAT with 'repo' scope (full control of private repositories) is needed.
+          # Store this PAT as a secret (e.g., REPO_ADMIN_PAT) in repository/organization settings.
+          GH_TOKEN_FOR_VISIBILITY: ${{ secrets.REPO_ADMIN_PAT }} # Or use GITHUB_TOKEN if it has admin rights
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "Attempting to change repository visibility to private for $GH_REPO."
+          # Ensure gh CLI uses the correct token
+          echo "$GH_TOKEN_FOR_VISIBILITY" | gh auth login --with-token
+          gh repo edit "$GH_REPO" --visibility private
+          
+          # Verify current visibility
+          # Re-authenticate with default token if needed for other gh commands, or ensure PAT has read access too
+          # For simplicity, assume PAT allows view or use a specific view command if needed.
+          sleep 5 # Give GitHub a moment to process the change
+          NEW_VISIBILITY=$(gh repo view "$GH_REPO" --json visibility --jq .visibility)
+          if [ "$NEW_VISIBILITY" = "PRIVATE" ]; then # GitHub API returns uppercase PRIVATE
+            echo "Repository visibility successfully changed to private."
+            echo "::set-output name=visibility_changed_successfully::true"
+          else
+            echo "Failed to change repository visibility. Current visibility: $NEW_VISIBILITY"
+            echo "This could be due to insufficient permissions for the token used (secrets.REPO_ADMIN_PAT)."
+            echo "::set-output name=visibility_changed_successfully::false"
+            # Do not exit 1 here, let the notification step handle it.
+          fi
+        id: change_visibility_step
+
+      - name: Notify on visibility change failure
+        if: steps.decision.outputs.change_visibility == 'true' && steps.change_visibility_step.outputs.visibility_changed_successfully == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Default token for creating issues
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          echo "Failed to change repository visibility to private for $REPO_SLUG."
+          gh issue create --title "Failed to change repository visibility to Private" \
+                          --body "The workflow attempted to change the visibility of repository ${REPO_SLUG} to Private, but it failed. Please check the workflow logs and repository settings/permissions. Last merge timestamp: ${{ steps.last_merge_date.outputs.timestamp }}. Open PRs: ${{ steps.open_prs.outputs.count }}." \
+                          --label "bug,automation,security"
+
+      - name: Skip visibility change
+        if: steps.decision.outputs.change_visibility == 'false'
+        run: |
+          echo "Skipping visibility change based on the calculated conditions."
