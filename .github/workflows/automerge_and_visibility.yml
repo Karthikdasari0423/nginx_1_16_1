@@ -1,208 +1,167 @@
-name: Auto Merge and Change Visibility
+name: Repository Management
 
+# This workflow triggers on two main events:
+# 1. 'pull_request': To handle automatic merging of PRs.
+# 2. 'schedule': To periodically check for inactivity and manage repository visibility.
+# 3. 'workflow_dispatch': To allow manual triggering of the workflow.
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    # Trigger this workflow when a pull request is opened, has labels added/removed,
+    # is synchronized (new commits pushed to the branch), or is reopened.
+    types: [labeled, opened, synchronize, reopened]
   schedule:
-    # Runs daily at midnight UTC to check for visibility change
+    # Run this job once a day at 00:00 UTC.
+    # You can adjust the cron schedule as needed (e.g., '0 0 * * MON' for weekly on Monday).
     - cron: '0 0 * * *'
-  workflow_dispatch: # Allows manual triggering
+  workflow_dispatch: # This enables manual triggering from the GitHub Actions UI
 
 jobs:
-  auto_merge:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' # Only run this job for pull_request events
+  auto-merge-prs:
+    # This job is responsible for automatically merging pull requests.
+    # It will now run for any pull_request event, not just those with a specific label.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest # Specifies the runner environment.
     permissions:
-      contents: write      # Needed to push the timestamp file
-      pull-requests: write # Needed to merge PRs
-      issues: write        # Needed to create issues on failure
+      # Grant specific permissions to the default GITHUB_TOKEN for this job.
+      pull-requests: write # Required for merging pull requests.
+      contents: write      # Required for pushing the merged changes back to the repository.
+      # Note: 'actions: write' might be useful for interacting with checks, but is typically
+      # not strictly necessary for basic automerge functionality.
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout Repository Code
+        # This action checks out your repository's code, allowing subsequent steps to access it.
+        uses: actions/checkout@v4
+
+      - name: Auto-merge Pull Request
+        # This action facilitates automatic merging of PRs.
+        # It waits for all required status checks to pass before attempting the merge.
+        # The 'merge_labels' parameter is now empty, meaning it will attempt to merge any PR
+        # that meets other criteria (like passing required status checks and no 'do-not-merge' labels).
+        uses: pascalgn/automerge-action@v0.16.0
+        env:
+          # The GITHUB_TOKEN is a temporary token provided by GitHub Actions for each workflow run.
+          # It has permissions based on the 'permissions' block defined above.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Fetch full history to be able to push back to the branch
-          fetch-depth: 0 
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # The 'merge_labels' parameter is now empty, indicating that no specific label
+          # is required to trigger auto-merge. The action will proceed if other conditions are met.
+          merge_labels: ""
+          # The merge method to use: 'merge' (creates a merge commit), 'squash' (combines all commits into one),
+          # or 'rebase' (replays commits from the PR branch onto the base branch).
+          merge_method: squash
+          # Optional: A comma-separated list of required status checks that must pass before merging.
+          # If left empty, the action respects the branch protection rules configured in your repository.
+          # Example: merge_required_statuses: "build, test-suite"
+          merge_required_statuses: ""
+          # Optional: If true, the action will attempt to update the PR branch with the latest changes
+          # from the base branch before trying to merge, which can help resolve conflicts automatically.
+          update_branch: true
+          # Optional: Labels that, if present on a PR, will prevent auto-merge, even if 'auto-merge' is present.
+          do_not_merge_labels: do-not-merge, blocked
+          # Optional: Set to 'true' if at least one approving review is required before merging.
+          # review_required: true
 
-      - name: Get PR data
-        id: pr_data
-        run: |
-          echo "PR_NUMBER=$(jq --raw-output .pull_request.number "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
-          echo "IS_MERGEABLE=$(jq --raw-output .pull_request.mergeable "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
-          echo "MERGE_STATE=$(jq --raw-output .pull_request.mergeable_state "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
-          # Get head SHA and base ref for commit/push operations
-          echo "PR_HEAD_SHA=$(jq --raw-output .pull_request.head.sha "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
-          echo "PR_BASE_REF=$(jq --raw-output .pull_request.base.ref "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
-
-      - name: Auto-merge PR
-        # This step enables GitHub's auto-merge feature.
-        # It will merge only if there are no merge conflicts AND all branch protection rules are met (e.g., passing checks, required reviews if any).
-        if: steps.pr_data.outputs.IS_MERGEABLE == 'true' && (steps.pr_data.outputs.MERGE_STATE == 'clean' || steps.pr_data.outputs.MERGE_STATE == 'behind' || steps.pr_data.outputs.MERGE_STATE == 'unstable')
-        # MERGE_STATE 'clean' means all checks passed and ready.
-        # 'behind' means it's not up to date with base, but still potentially mergeable if checks pass after update.
-        # 'unstable' means checks are running or some non-required checks failed.
-        # GitHub's auto-merge will handle these states and merge when ready (e.g. after auto-update if enabled for 'behind', or when 'unstable' becomes 'clean').
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.pr_data.outputs.PR_NUMBER }}
-          PR_HEAD_SHA: ${{ steps.pr_data.outputs.PR_HEAD_SHA }}
-        run: |
-          echo "Attempting to enable auto-merge for PR #$PR_NUMBER with HEAD SHA $PR_HEAD_SHA."
-          echo "Current mergeable state: ${{ steps.pr_data.outputs.MERGE_STATE }}"
-          gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
-          echo "Auto-merge enabled for PR #$PR_NUMBER. GitHub will merge when all conditions (no conflicts, passing required checks, met review policies) are satisfied."
-
-      - name: Verify merge and update timestamp
-        id: verify_merge
-        # Run this step if auto-merge was attempted.
-        # The PR merge happens asynchronously when using 'gh pr merge --auto'.
-        # This step checks after a delay if the merge has occurred.
-        if: steps.pr_data.outputs.IS_MERGEABLE == 'true' && (steps.pr_data.outputs.MERGE_STATE == 'clean' || steps.pr_data.outputs.MERGE_STATE == 'behind' || steps.pr_data.outputs.MERGE_STATE == 'unstable')
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.pr_data.outputs.PR_NUMBER }}
-          PR_BASE_REF: ${{ steps.pr_data.outputs.PR_BASE_REF }}
-        run: |
-          echo "::set-output name=merged_successfully::false" # Default to false
-          echo "Waiting 30 seconds for auto-merge to process..." # Increased wait time
-          sleep 30 
-          PR_MERGED_STATUS=$(gh pr view "$PR_NUMBER" --json merged --jq .merged)
-
-          if [ "$PR_MERGED_STATUS" = "true" ]; then
-            echo "PR #$PR_NUMBER was merged. Updating timestamp."
-            echo "::set-output name=merged_successfully::true"
-            
-            # Checkout the base branch to commit the timestamp file
-            # Ensure local ref is updated before checkout
-            git fetch origin ${{ env.PR_BASE_REF }} 
-            git checkout ${{ env.PR_BASE_REF }}
-            # Ensure it's up-to-date with remote before pushing new commit
-            git pull origin ${{ env.PR_BASE_REF }} 
-
-            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .last_successful_merge_timestamp
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add .last_successful_merge_timestamp
-            # Commit and push only if there are changes
-            if ! git diff --staged --quiet; then
-              git commit -m "CI: Update last successful PR merge timestamp after merging PR #$PR_NUMBER"
-              # Retry push in case of minor transient issues
-              for i in 1 2 3; do git push origin ${{ env.PR_BASE_REF }} && break || sleep 5; done
-            else
-              echo "No changes to .last_successful_merge_timestamp to commit (file likely already up-to-date)."
-            fi
-          else
-            echo "PR #$PR_NUMBER not confirmed as merged after 30s wait. It might merge later if auto-merge conditions are met, or it might require manual action if checks fail or reviews are pending indefinitely."
-          fi
-      
-      - name: Notify on merge processing (if merge not immediately confirmed)
-        # This notification means the auto-merge was enabled, but the PR wasn't merged within the 30s check.
-        # It's not strictly a "failure" of enabling auto-merge, but a status update.
-        if: steps.pr_data.outputs.IS_MERGEABLE == 'true' &&             (steps.pr_data.outputs.MERGE_STATE == 'clean' || steps.pr_data.outputs.MERGE_STATE == 'behind' || steps.pr_data.outputs.MERGE_STATE == 'unstable') &&             steps.verify_merge.outputs.merged_successfully == 'false'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.pr_data.outputs.PR_NUMBER }}
-          REPO_SLUG: ${{ github.repository }}
-        run: |
-          echo "Auto-merge for PR #$PR_NUMBER was enabled, but the merge was not confirmed after 30 seconds."
-          echo "The PR may merge later if all conditions (passing checks, required reviews) are met."
-          echo "If it remains unmerged, please check the PR for failing checks or other unsatisfied merge requirements: ${{ github.event.pull_request.html_url }}"
-          # Optionally create an issue for follow-up if it's critical that it merges quickly
-          # gh issue create --title "Auto-merge for PR #${PR_NUMBER} pending"           #                 --body "Auto-merge was enabled for PR #${PR_NUMBER} in repository ${REPO_SLUG}. It was not confirmed as merged after 30s. Please monitor. PR URL: ${{ github.event.pull_request.html_url }}"           #                 --label "automation,auto-merge-pending"
-
-  change_visibility:
-    runs-on: ubuntu-latest
+  manage-repository-visibility:
+    # This job is responsible for managing the repository's visibility.
+    # It runs daily according to the schedule configured in the 'on:' section.
+    # It also runs when triggered manually via workflow_dispatch.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    permissions:
-      contents: read         # To read the .last_successful_merge_timestamp
-      # administration: write  # This scope is not valid here. Token permissions are key.
-      issues: write          # To create issues on failure
+    runs-on: ubuntu-latest # Specifies the runner environment.
+    # It's good practice to associate jobs that handle sensitive operations with a GitHub Environment.
+    # Ensure you have a 'production' environment configured in your repository settings (Settings > Environments).
+    environment:
+      name: production
+    # The GITHUB_TOKEN permissions for this job are implicitly handled,
+    # as the 'gh api' call relies on the REPO_VISIBILITY_PAT.
+    # No specific GITHUB_TOKEN permissions are explicitly required here for the visibility change.
     steps:
-      - name: Checkout code (default branch)
-        uses: actions/checkout@v3
+      - name: Setup GitHub CLI
+        # This action installs and configures the GitHub CLI on the runner.
+        # The GitHub CLI makes it easier to interact with the GitHub API.
+        uses: cli/cli@v2
         with:
-          ref: ${{ github.event.repository.default_branch || 'main' }}
-          token: ${{ secrets.GITHUB_TOKEN }} 
-          fetch-depth: 1 # Only need the latest commit to get the file
+          version: 'latest' # Use the latest available version of the GitHub CLI.
 
-      - name: Get last successful merge timestamp
-        id: last_merge_date
-        run: |
-          if [ -f .last_successful_merge_timestamp ]; then
-            MERGE_TS=$(cat .last_successful_merge_timestamp)
-            echo "timestamp=$MERGE_TS" >> $GITHUB_OUTPUT
-            echo "Found last merge timestamp: $MERGE_TS"
-          else
-            echo "timestamp=1970-01-01T00:00:00Z" >> $GITHUB_OUTPUT
-            echo "No .last_successful_merge_timestamp file found. Assuming no PRs merged by this workflow yet."
-          fi
-
-      - name: Check for open PRs
-        id: open_prs
+      - name: Authenticate GitHub CLI with Personal Access Token (PAT)
+        # Login to GitHub CLI using the Personal Access Token (PAT).
+        # This PAT (REPO_VISIBILITY_PAT) must be stored in your repository's secrets.
+        # It requires 'repo' scope permissions to modify repository settings.
+        run: echo "${{ secrets.REPO_VISIBILITY_PAT }}" | gh auth login --with-token
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
-        run: |
-          OPEN_PRS_COUNT=$(gh pr list --state open --limit 100 --json number --jq 'length')
-          echo "count=$OPEN_PRS_COUNT" >> $GITHUB_OUTPUT
-          echo "Found $OPEN_PRS_COUNT open PR(s)."
+          # Set the GH_TOKEN environment variable, which the 'gh' CLI automatically uses for authentication.
+          GH_TOKEN: ${{ secrets.REPO_VISIBILITY_PAT }}
 
-      - name: Calculate dates and decide on visibility change
-        id: decision
+      - name: Get Latest Merged Pull Request Date
+        id: get-last-pr # Assigns an ID to this step so its outputs can be referenced by other steps.
         run: |
-          LAST_MERGE_TIMESTAMP="${{ steps.last_merge_date.outputs.timestamp }}"
-          LAST_MERGE_SECONDS=$(date -d "$LAST_MERGE_TIMESTAMP" +%s)
-          SIX_MONTHS_AGO_SECONDS=$(date -d "now - 6 months" +%s)
-          
-          echo "Last merge timestamp: $LAST_MERGE_TIMESTAMP (Epoch: $LAST_MERGE_SECONDS)"
-          echo "Six months ago timestamp: $(date -d @$SIX_MONTHS_AGO_SECONDS -u +%Y-%m-%dT%H:%M:%SZ) (Epoch: $SIX_MONTHS_AGO_SECONDS)"
-          
-          CHANGE_VISIBILITY="false"
-          # NEW LOGIC: Only check timestamp, ignore open PR count for decision to change
-          if [ "$LAST_MERGE_SECONDS" -lt "$SIX_MONTHS_AGO_SECONDS" ]; then
-            if [ "$LAST_MERGE_TIMESTAMP" != "1970-01-01T00:00:00Z" ]; then # Ensure a merge has actually been recorded by the workflow
-              CHANGE_VISIBILITY="true"
-              echo "Decision: Last merge was over 6 months ago. Conditions met to change visibility to private (open PRs: ${{ steps.open_prs.outputs.count }} - will be ignored for decision)."
-            else
-              echo "Decision: Do not change visibility. No PRs have been recorded as merged by this workflow yet (timestamp is default)."
-            fi
+          # Use GitHub CLI to call the GitHub REST API to fetch pull requests.
+          # We're looking for closed PRs, sorted by their last update time in descending order.
+          # We fetch up to 100 PRs to increase the likelihood of finding a recently merged one.
+          PR_LIST_JSON=$(gh api repos/${{ github.repository }}/pulls \
+                          --header 'Accept: application/vnd.github.v3+json' \
+                          -F state=closed \
+                          -F sort=updated \
+                          -F direction=desc \
+                          -F per_page=100)
+
+          # Use 'jq' (a lightweight and flexible command-line JSON processor) to parse the JSON response.
+          # We filter the list of PRs to find the first one that has a non-null 'merged_at' timestamp.
+          # If no merged PRs are found in the fetched list, 'jq' will output "null".
+          LAST_MERGED_PR_DATE=$(echo "$PR_LIST_JSON" | jq -r '.[0:] | map(select(.merged_at != null)) | .[0].merged_at')
+
+          # Check if a merged PR date was found.
+          if [ "$LAST_MERGED_PR_DATE" = "null" ] || [ -z "$LAST_MERGED_PR_DATE" ]; then
+            echo "No recently merged pull requests found within the last 100 closed PRs."
+            echo "Assuming a long period of inactivity for the repository."
+            # If no merged PRs are found (e.g., repository is brand new or truly very old),
+            # set the date to Epoch (January 1, 1970 UTC) to ensure the 6-month inactivity condition is met.
+            LAST_MERGED_PR_DATE="1970-01-01T00:00:00Z"
           else
-            echo "Decision: Do not change visibility. Last merge ($LAST_MERGE_TIMESTAMP) was less than 6 months ago."
+            echo "Successfully retrieved last merged PR date: $LAST_MERGED_PR_DATE"
           fi
-          echo "change_visibility=$CHANGE_VISIBILITY" >> $GITHUB_OUTPUT
           
-      - name: Change repository visibility to private
-        if: steps.decision.outputs.change_visibility == 'true'
-        env:
-          # CRITICAL: This token MUST have admin permissions for the repository.
-          GH_TOKEN_FOR_VISIBILITY: ${{ secrets.REPO_ADMIN_PAT }} 
-          GH_REPO: ${{ github.repository }}
+          # Output the determined last merged PR date so it can be used by the next step.
+          echo "last_merged_pr_date=$LAST_MERGED_PR_DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate Inactivity Period and Change Visibility
         run: |
-          echo "Attempting to change repository visibility to private for $GH_REPO."
-          echo "$GH_TOKEN_FOR_VISIBILITY" | gh auth login --with-token
-          gh repo edit "$GH_REPO" --visibility private
+          # Retrieve the last merged PR date from the output of the previous step.
+          # This date is used to determine repository inactivity.
+          LAST_MERGED_PR_DATE="${{ steps.get-last-pr.outputs.last_merged_pr_date }}"
+          # Get the current UTC date and time.
+          CURRENT_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+          # Convert both dates to Unix timestamps (seconds since January 1, 1970 UTC)
+          # This allows for easy and accurate comparison of time differences.
+          LAST_MERGED_TIMESTAMP=$(date -d "$LAST_MERGED_PR_DATE" +%s)
+          CURRENT_TIMESTAMP=$(date -d "$CURRENT_DATE" +%s)
+
+          # Calculate the time difference between the current date and the last merged PR date, in seconds.
+          DIFF_SECONDS=$((CURRENT_TIMESTAMP - LAST_MERGED_TIMESTAMP))
           
-          sleep 5 # Give GitHub a moment to process the change
-          NEW_VISIBILITY=$(gh repo view "$GH_REPO" --json visibility --jq .visibility)
-          if [ "$NEW_VISIBILITY" = "PRIVATE" ]; then 
+          # Define the threshold for 6 months of inactivity in seconds.
+          # We use 180 days as an approximation for 6 months (180 days * 24 hours/day * 60 minutes/hour * 60 seconds/minute).
+          SIX_MONTHS_IN_SECONDS=$((180 * 24 * 60 * 60))
+
+          echo "Current time (UTC): $CURRENT_DATE (Timestamp: $CURRENT_TIMESTAMP)"
+          echo "Last merged PR time (UTC): $LAST_MERGED_PR_DATE (Timestamp: $LAST_MERGED_TIMESTAMP)"
+          echo "Calculated time difference: $DIFF_SECONDS seconds."
+          echo "Threshold for 6 months inactivity: $SIX_MONTHS_IN_SECONDS seconds."
+
+          # Check if the time difference exceeds the 6-month threshold.
+          if (( DIFF_SECONDS > SIX_MONTHS_IN_SECONDS )); then
+            echo "Inactivity detected: Last PR was merged more than 6 months ago."
+            echo "Proceeding to change repository visibility to private."
+            
+            # Use GitHub CLI to send a PATCH request to the GitHub API to update repository settings.
+            # The 'visibility' field is set to 'private'.
+            # This uses the PAT that was authenticated in a previous step.
+            gh api --method PATCH -H "Accept: application/vnd.github.v3+json" \
+                   "/repos/${{ github.repository }}" \
+                   -f visibility=private
+            
             echo "Repository visibility successfully changed to private."
-            echo "::set-output name=visibility_changed_successfully::true"
           else
-            echo "Failed to change repository visibility. Current visibility: $NEW_VISIBILITY"
-            echo "This could be due to insufficient permissions for the token used (secrets.REPO_ADMIN_PAT)."
-            echo "::set-output name=visibility_changed_successfully::false"
+            echo "No significant inactivity detected: Last PR merged less than 6 months ago."
+            echo "Repository visibility will remain unchanged (public or current setting)."
           fi
-        id: change_visibility_step
-
-      - name: Notify on visibility change failure
-        if: steps.decision.outputs.change_visibility == 'true' && steps.change_visibility_step.outputs.visibility_changed_successfully == 'false'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Default token for creating issues
-          REPO_SLUG: ${{ github.repository }}
-        run: |
-          echo "Failed to change repository visibility to private for $REPO_SLUG."
-          gh issue create --title "Failed to change repository visibility to Private"                           --body "The workflow attempted to change the visibility of repository ${REPO_SLUG} to Private, but it failed. Please check the workflow logs and repository settings/permissions. Last merge timestamp: ${{ steps.last_merge_date.outputs.timestamp }}. Open PRs: ${{ steps.open_prs.outputs.count }}."                           --label "bug,automation,security" # Labels for the issue are kept as per your confirmation
-
-      - name: Skip visibility change
-        if: steps.decision.outputs.change_visibility == 'false'
-        run: |
-          echo "Skipping visibility change based on the calculated conditions."
