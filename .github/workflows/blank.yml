@@ -1,0 +1,75 @@
+# GitHub Workflow for managing repository visibility
+
+name: Manage Repository Visibility
+
+on:
+  schedule:
+    # Runs daily at midnight UTC
+    - cron: "0 0 * * *"
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  manage_visibility:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # To checkout the repository
+      # The GITHUB_TOKEN by default has 'repo' scope in most contexts,
+      # which should be sufficient to change visibility for the repository the workflow runs in.
+      # For organization-owned repositories, if the default token permissions are restricted,
+      # a custom PAT (Personal Access Token) with 'repo' or 'admin:org' scope might be
+      # needed, passed as a secret (e.g., secrets.PAT_WITH_REPO_SCOPE).
+      # We will rely on the default GITHUB_TOKEN permissions. If changing visibility fails,
+      # this is the primary area to investigate and potentially use a PAT.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Using the built-in GITHUB_TOKEN
+
+      - name: Check and Update Repository Visibility
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_NAME: ${{ github.repository }} # Gets the owner/repo format
+        run: |
+          echo "Processing repository: $REPO_NAME"
+
+          # Get repository creation date and current visibility
+          REPO_INFO=$(gh repo view $REPO_NAME --json createdAt,visibility --jq '. | .createdAt + " " + .visibility')
+          CREATED_AT=$(echo $REPO_INFO | cut -d' ' -f1)
+          CURRENT_VISIBILITY=$(echo $REPO_INFO | cut -d' ' -f2)
+
+          echo "Repository created at: $CREATED_AT"
+          echo "Current visibility: $CURRENT_VISIBILITY"
+
+          # Calculate age in seconds
+          CREATED_AT_SECONDS=$(date -d "$CREATED_AT" +%s)
+          CURRENT_SECONDS=$(date +%s)
+          AGE_SECONDS=$((CURRENT_SECONDS - CREATED_AT_SECONDS))
+
+          # 6 months in seconds (approximate: 6 * 30.44 days/month * 24 hours/day * 60 minutes/hour * 60 seconds/minute)
+          SIX_MONTHS_SECONDS=$((6 * 3044 * 24 * 60 * 6)) # A more precise calculation: 6 * 30.4375 * 86400
+          # SIX_MONTHS_SECONDS=15552000 # Approximately 6 * 30 * 24 * 60 * 60, can be adjusted
+
+          echo "Repository age in seconds: $AGE_SECONDS"
+          echo "Six months in seconds: $SIX_MONTHS_SECONDS"
+
+          if [ "$CURRENT_VISIBILITY" = "PUBLIC" ] && [ "$AGE_SECONDS" -gt "$SIX_MONTHS_SECONDS" ]; then
+            echo "Repository is older than 6 months and is public. Changing to private."
+            gh repo edit $REPO_NAME --visibility private
+            if [ $? -eq 0 ]; then
+              echo "Successfully changed visibility to private."
+            else
+              echo "Failed to change visibility. Check permissions and token scopes."
+              exit 1
+            fi
+          elif [ "$CURRENT_VISIBILITY" != "PUBLIC" ]; then
+            echo "Repository is not public. No action needed regarding age."
+          else
+            echo "Repository is not older than 6 months. No action needed."
+          fi
