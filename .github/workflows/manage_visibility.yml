@@ -29,7 +29,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gh
-        env: # Explicitly set for this step, even if redundant with job level, to satisfy gh CLI checks
+          echo "${{ github.token }}" | gh auth login --with-token
+        env: # Explicitly set for this step to ensure gh auth login works
           GH_TOKEN: ${{ github.token }}
 
       - name: Check and Update Repository Visibility
