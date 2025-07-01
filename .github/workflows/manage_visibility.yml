@@ -12,14 +12,14 @@ jobs:
   manage_visibility:
     runs-on: ubuntu-latest
     permissions:
-      contents: read # To checkout the repository
-      # The default GITHUB_TOKEN does not have sufficient permissions to change repository visibility
-      # in some contexts (evidenced by HTTP 403 errors).
-      # To fix this, a Personal Access Token (PAT) with the 'repo' scope is required.
-      # 1. Create a PAT: Go to your GitHub settings -> Developer settings -> Personal access tokens -> Tokens (classic).
-      #    Grant the 'repo' scope.
-      # 2. Add the PAT as a secret: In your repository, go to Settings -> Secrets and variables -> Actions -> New repository secret.
-      #    Name the secret REPO_ACCESS_TOKEN (or match the name used below) and paste your PAT.
+      # The default GITHUB_TOKEN (github.token) is used for general gh CLI setup in Actions.
+      # However, it may not have 'repo' scope permissions to change visibility.
+      # A Personal Access Token (PAT) with 'repo' scope is required for privileged operations.
+      # 1. Create PAT: GitHub settings -> Developer settings -> PATs (classic) -> 'repo' scope.
+      # 2. Add Secret: Repo Settings -> Secrets -> Actions -> New: REPO_ACCESS_TOKEN.
+      contents: read # For checkout
+    env: # Set GH_TOKEN at job level for gh CLI's general satisfaction in Actions
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout code
@@ -29,18 +29,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gh
-        env:
-          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }} # Using a PAT stored as a secret
+        # GH_TOKEN from job env (github.token) is implicitly used here by gh CLI
 
       - name: Check and Update Repository Visibility
         env:
-          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }} # Using a PAT stored as a secret
+          # REPO_ACCESS_TOKEN is used specifically for commands needing higher privileges
+          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
           REPO_NAME: ${{ github.repository }} # Gets the owner/repo format
         run: |
           echo "Processing repository: $REPO_NAME"
 
-          # Get repository creation date and current visibility
-          REPO_INFO=$(gh repo view $REPO_NAME --json createdAt,visibility --jq '. | .createdAt + " " + .visibility')
+          # Get repository creation date and current visibility using the PAT
+          REPO_INFO=$(GH_TOKEN=$REPO_ACCESS_TOKEN gh repo view $REPO_NAME --json createdAt,visibility --jq '. | .createdAt + " " + .visibility')
           CREATED_AT=$(echo $REPO_INFO | cut -d' ' -f1)
           CURRENT_VISIBILITY=$(echo $REPO_INFO | cut -d' ' -f2)
 
@@ -60,7 +60,8 @@ jobs:
 
           if [ "$CURRENT_VISIBILITY" = "PUBLIC" ] && [ "$AGE_SECONDS" -gt "$ONE_WEEK_SECONDS" ]; then
             echo "Repository is older than 1 week and is public. Changing to private."
-            gh repo edit $REPO_NAME --visibility private --accept-visibility-change-consequences
+            # Use PAT for the edit command
+            GH_TOKEN=$REPO_ACCESS_TOKEN gh repo edit $REPO_NAME --visibility private --accept-visibility-change-consequences
             if [ $? -eq 0 ]; then
               echo "Successfully changed visibility to private."
             else
