@@ -13,13 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # To checkout the repository
-      # The GITHUB_TOKEN by default has 'repo' scope in most contexts,
-      # which should be sufficient to change visibility for the repository the workflow runs in.
-      # For organization-owned repositories, if the default token permissions are restricted,
-      # a custom PAT (Personal Access Token) with 'repo' or 'admin:org' scope might be
-      # needed, passed as a secret (e.g., secrets.PAT_WITH_REPO_SCOPE).
-      # We will rely on the default GITHUB_TOKEN permissions. If changing visibility fails,
-      # this is the primary area to investigate and potentially use a PAT.
+      # The default GITHUB_TOKEN does not have sufficient permissions to change repository visibility
+      # in some contexts (evidenced by HTTP 403 errors).
+      # To fix this, a Personal Access Token (PAT) with the 'repo' scope is required.
+      # 1. Create a PAT: Go to your GitHub settings -> Developer settings -> Personal access tokens -> Tokens (classic).
+      #    Grant the 'repo' scope.
+      # 2. Add the PAT as a secret: In your repository, go to Settings -> Secrets and variables -> Actions -> New repository secret.
+      #    Name the secret REPO_ACCESS_TOKEN (or match the name used below) and paste your PAT.
 
     steps:
       - name: Checkout code
@@ -30,11 +30,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Using the built-in GITHUB_TOKEN
+          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }} # Using a PAT stored as a secret
 
       - name: Check and Update Repository Visibility
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }} # Using a PAT stored as a secret
           REPO_NAME: ${{ github.repository }} # Gets the owner/repo format
         run: |
           echo "Processing repository: $REPO_NAME"
