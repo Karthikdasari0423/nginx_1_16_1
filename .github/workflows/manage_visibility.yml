@@ -60,7 +60,7 @@ jobs:
 
           if [ "$CURRENT_VISIBILITY" = "PUBLIC" ] && [ "$AGE_SECONDS" -gt "$ONE_WEEK_SECONDS" ]; then
             echo "Repository is older than 1 week and is public. Changing to private."
-            gh repo edit $REPO_NAME --visibility private
+            gh repo edit $REPO_NAME --visibility private --accept-visibility-change-consequences
             if [ $? -eq 0 ]; then
               echo "Successfully changed visibility to private."
             else
