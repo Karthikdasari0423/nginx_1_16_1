@@ -55,14 +55,14 @@ jobs:
           CURRENT_SECONDS=$(date +%s)
           AGE_SECONDS=$((CURRENT_SECONDS - CREATED_AT_SECONDS))
 
-          # 1 week in seconds (7 days * 24 hours/day * 60 minutes/hour * 60 seconds/minute)
-          ONE_WEEK_SECONDS=$((7 * 24 * 60 * 60))
+          # 6 months in seconds (approximate: 6 months * 30.4375 days/month * 24 hours/day * 60 minutes/hour * 60 seconds/minute)
+          SIX_MONTHS_SECONDS=$(echo "6 * 30.4375 * 24 * 60 * 60" | bc | cut -d. -f1)
 
           echo "Repository age in seconds: $AGE_SECONDS"
-          echo "One week in seconds: $ONE_WEEK_SECONDS"
+          echo "Six months in seconds: $SIX_MONTHS_SECONDS"
 
-          if [ "$CURRENT_VISIBILITY" = "PUBLIC" ] && [ "$AGE_SECONDS" -gt "$ONE_WEEK_SECONDS" ]; then
-            echo "Repository is older than 1 week and is public. Changing to private."
+          if [ "$CURRENT_VISIBILITY" = "PUBLIC" ] && [ "$AGE_SECONDS" -gt "$SIX_MONTHS_SECONDS" ]; then
+            echo "Repository is older than 6 months and is public. Changing to private."
             # Use PAT for the edit command
             GH_TOKEN=$REPO_ACCESS_TOKEN gh repo edit $REPO_NAME --visibility private --accept-visibility-change-consequences
             if [ $? -eq 0 ]; then
@@ -74,5 +74,5 @@ jobs:
           elif [ "$CURRENT_VISIBILITY" != "PUBLIC" ]; then
             echo "Repository is not public. No action needed regarding age."
           else
-            echo "Repository is not older than 1 week. No action needed."
+            echo "Repository is not older than 6 months. No action needed."
           fi
