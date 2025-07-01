@@ -29,7 +29,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gh
-        # GH_TOKEN from job env (github.token) is implicitly used here by gh CLI
+        env: # Explicitly set for this step, even if redundant with job level, to satisfy gh CLI checks
+          GH_TOKEN: ${{ github.token }}
 
       - name: Check and Update Repository Visibility
         env:
